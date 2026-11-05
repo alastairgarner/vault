@@ -32,7 +32,7 @@ TypeScript MCP SDK, with stdio and opt-in stateless Streamable HTTP transports.
 The local Docker configuration publishes its HTTP port on loopback only.
 V2 now requires manually configured bearer tokens for HTTP MCP requests;
 registered clients can read/search and edit existing supported notes throughout
-the allowed root; new notes are restricted to lowercase root-relative `ai/`
+the allowed root; new notes are restricted to lowercase root-relative `ai/` or `meetings/`
 with existing parent directories, for both HTTP and stdio. See
 [authentication setup](authentication.md). Stdio remains local-process access.
 

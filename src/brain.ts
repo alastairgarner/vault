@@ -9,6 +9,8 @@ import type { ExactEdit } from './files.js';
 import { errorMessage } from './errors.js';
 import { decodeImage } from './images.js';
 
+const createRoots = ['ai/', 'meetings/'];
+
 export type Freshness = { externalChanges: 'not-monitored' } & (
   | { state: 'pending' }
   | { state: 'stale'; reason: string }
@@ -132,7 +134,7 @@ export class Brain {
   }
   create(name: string, content: string) {
     return this.run(async () => {
-      if (!name.startsWith('ai/')) throw new Error('New notes must be created inside root-relative lowercase ai/');
+      if (!createRoots.some(root => name.startsWith(root))) throw new Error('New notes must be created inside root-relative lowercase ai/ or meetings/');
       await this.checkWriteCapacity(name, Buffer.byteLength(content));
       const result = await this.notes.publish(name, content, true);
       this.freshness = { ...this.freshness, state: 'stale', reason: 'File changed' };

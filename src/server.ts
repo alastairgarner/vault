@@ -42,7 +42,7 @@ export function createServer(brain: Brain): McpServer {
   }, a => respond(() => brain.read(a.path, a.fromLine, a.maxLines)));
 
   server.registerTool('note_create', {
-    description: 'Atomically create a Markdown note strictly inside root-relative lowercase ai/ (including existing subdirectories); parent directory must already exist; never overwrite.',
+    description: 'Atomically create a Markdown note strictly inside root-relative lowercase ai/ or meetings/ (including existing subdirectories); parent directory must already exist; never overwrite.',
     inputSchema: { path: name, content: text },
   }, a => respond(() => brain.create(a.path, a.content)));
 
