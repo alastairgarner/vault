@@ -7,7 +7,7 @@ MCP processing. There is no unauthenticated HTTP mode or old-flag fallback.
 
 Each registered token has a unique client name and the same allowed-root policy:
 read/search and edit existing supported Markdown anywhere; create new notes only
-inside lowercase root-relative `ai/`, including existing subdirectories. Parent
+inside lowercase root-relative `ai/` or `meetings/`, including existing subdirectories. Parent
 directories must already exist. All clients can also use `attachment_create` to
 upload PNG/JPEG/GIF/WebP images only under lowercase root-relative
 `ai/attachments/`, with existing parents, max 1 MiB, matching signature/extension

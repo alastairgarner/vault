@@ -118,9 +118,12 @@ test('traversal, symlinks, hardlinks, hidden files and special files cannot esca
   assert.equal(await fs.readFile(secret, 'utf8'), 'outside-secret');
 });
 
-test('creation is confined to lowercase ai/ with existing parents; reads and edits remain vault-wide', async t => {
+test('creation is confined to lowercase ai/ or meetings/ with existing parents; reads and edits remain vault-wide', async t => {
   const { brain, root, base } = await fixture(t);
   await fs.mkdir(path.join(root, 'ai', 'nested'));
+  await fs.mkdir(path.join(root, 'meetings'));
+  await fs.mkdir(path.join(root, 'meetings-other'));
+  await fs.mkdir(path.join(root, 'Meetings'));
   await fs.mkdir(path.join(root, 'ai-other'));
   await fs.mkdir(path.join(root, 'AI'));
   await fs.mkdir(path.join(base, 'outside'));
@@ -135,6 +138,7 @@ test('creation is confined to lowercase ai/ with existing parents; reads and edi
     'ai/linked.md', 'ai/.hidden.md', 'ai/note.MD', 'ai/a\\b.md', 'ai/a\0b.md',
     'ai/package.json', 'ai/index.js', 'ai/photo.png', 'ai/video.mp4',
     'ai/missing/note.md', 'ai/node_modules/package.md',
+    'meetings-other/note.md', 'Meetings/note.md', 'meetings/../note.md', 'meetings/missing/note.md',
   ]) {
     await assert.rejects(brain.create(name, 'must not write'), name);
   }
@@ -155,7 +159,7 @@ test('creation is confined to lowercase ai/ with existing parents; reads and edi
   await brain.edit('existing.md', existing.hash, [{ oldText: 'original', newText: 'edited' }]);
   assert.equal((await brain.read('existing.md')).content, 'Orchid edited');
   assert.equal((await brain.search('Orchid')).results.length, 1);
-  for (const name of ['ai/note.md', 'ai/nested/note.md']) {
+  for (const name of ['ai/note.md', 'ai/nested/note.md', 'meetings/2026-11-05-standup.md']) {
     assert.equal((await brain.create(name, 'valid Markdown')).committed, true);
     await assert.rejects(brain.create(name, 'clobber'), /EEXIST/);
     assert.equal((await brain.read(name)).content, 'valid Markdown');
