@@ -8,6 +8,15 @@ import type { ResourceLimits } from './limits.js';
 import type { ExactEdit } from './files.js';
 import { errorMessage } from './errors.js';
 import { decodeImage } from './images.js';
+import { assertLinkableName, planMove } from './links.js';
+import type { LinkChange } from './links.js';
+
+type ReadResult = Awaited<ReturnType<Notes['read']>>;
+type LinkUpdate = { path: string; changes: LinkChange[] } & (
+  | { status: 'updated'; hash: string }
+  | { status: 'conflict' }
+  | { status: 'failed'; error: string }
+);
 
 const createRoots = ['ai/', 'meetings/'];
 
@@ -87,13 +96,21 @@ export class Brain {
   status(): BrainStatus {
     return { root: this.notes.root, searchMode: 'qmd-bm25', freshness: { ...this.freshness }, limits: { ...this.limits }, pendingOperations: this.pendingOperations };
   }
-  private async checkWriteCapacity(name: string, newBytes: number) {
-    if (newBytes > MAX_BYTES) throw new Error('File too large');
+  // `undefined` bytes means the write removes that file.
+  private async checkWriteCapacity(writes: ReadonlyMap<string, number | undefined>) {
+    if ([...writes.values()].some(bytes => bytes !== undefined && bytes > MAX_BYTES)) throw new Error('File too large');
     const names = await this.notes.list(true);
-    if (!names.includes(name) && names.length >= this.limits.maxCollectionFiles) throw new Error('Collection file limit exceeded');
-    let bytes = newBytes;
-    for (const existing of names) {
-      if (existing !== name) bytes += await this.notes.size(existing);
+    const existing = new Set(names);
+    let files = names.length;
+    let bytes = 0;
+    for (const [name, size] of writes) {
+      if (!existing.has(name) && size !== undefined) files++;
+      if (existing.has(name) && size === undefined) files--;
+      bytes += size ?? 0;
+    }
+    if (files > names.length && files > this.limits.maxCollectionFiles) throw new Error('Collection file limit exceeded');
+    for (const name of names) {
+      if (!writes.has(name)) bytes += await this.notes.size(name);
       if (bytes > this.limits.maxCollectionBytes) throw new Error('Collection byte limit exceeded');
     }
     if (bytes > this.limits.maxCollectionBytes) throw new Error('Collection byte limit exceeded');
@@ -135,7 +152,7 @@ export class Brain {
   create(name: string, content: string) {
     return this.run(async () => {
       if (!createRoots.some(root => name.startsWith(root))) throw new Error('New notes must be created inside root-relative lowercase ai/ or meetings/');
-      await this.checkWriteCapacity(name, Buffer.byteLength(content));
+      await this.checkWriteCapacity(new Map([[name, Buffer.byteLength(content)]]));
       const result = await this.notes.publish(name, content, true);
       this.freshness = { ...this.freshness, state: 'stale', reason: 'File changed' };
       await this.refreshInternal();
@@ -145,7 +162,7 @@ export class Brain {
   createAttachment(name: string, base64: string) {
     return this.run(async () => {
       const { bytes, mimeType } = decodeImage(name, base64);
-      await this.checkWriteCapacity(name, bytes.length);
+      await this.checkWriteCapacity(new Map([[name, bytes.length]]));
       const result = await this.notes.createImage(name, bytes);
       return { ...result, committed: true, bytes: bytes.length, mimeType };
     });
@@ -155,11 +172,72 @@ export class Brain {
       const file = await this.notes.read(name); // Hash checked INSIDE write serialization.
       if (file.hash !== expectedHash) throw new Error('Content hash conflict; read again');
       const content = replaceExact(file.content, edits);
-      await this.checkWriteCapacity(name, Buffer.byteLength(content));
+      await this.checkWriteCapacity(new Map([[name, Buffer.byteLength(content)]]));
       const result = await this.notes.publish(name, content, false);
       this.freshness = { ...this.freshness, state: 'stale', reason: 'File changed' };
       await this.refreshInternal();
       return { ...result, committed: true, freshness: this.status().freshness };
+    });
+  }
+  move({ from, to, expectedHash, dryRun }: { from: string; to: string; expectedHash: string; dryRun: boolean }) {
+    return this.run(async () => {
+      if (from === to) throw new Error('Destination must differ from source');
+      this.notes.checkPath(to);
+      assertLinkableName(to);
+      if (to.split('/').length - 1 > this.limits.maxScanDepth) throw new Error('Collection scan depth limit exceeded');
+      const source = await this.notes.read(from); // Hash checked INSIDE write serialization.
+      if (source.hash !== expectedHash) throw new Error('Content hash conflict; read again');
+      const names = await this.notes.list();
+      const clash = names.find(name => name !== from && name.toLowerCase() === to.toLowerCase());
+      if (clash) throw new Error(clash === to ? 'Destination already exists' : `Destination differs only by case from ${clash}`);
+      // Notes that cannot be read cannot be scanned for links; report rather than guess.
+      const notes = new Map<string, ReadResult>();
+      const unreadable: { path: string; error: string }[] = [];
+      for (const name of names) {
+        try { notes.set(name, await this.notes.read(name)); }
+        catch (error) { unreadable.push({ path: name, error: errorMessage(error).slice(0, 512) }); }
+      }
+      const plan = planMove({ from, to, format: await this.notes.linkFormat(),
+        notes: new Map([...notes].map(([name, file]) => [name, file.content])) });
+      const moved = plan.updates.get(from)?.content ?? source.content;
+      const writes = new Map<string, number | undefined>([[from, undefined], [to, Buffer.byteLength(moved)]]);
+      for (const [name, update] of plan.updates) if (name !== from) writes.set(name, Buffer.byteLength(update.content));
+      await this.checkWriteCapacity(writes);
+      const planned = [...plan.updates].map(([name, update]) => ({ path: name === from ? to : name, changes: update.changes }));
+      if (dryRun) return { from, to, dryRun, committed: false, links: planned.map(link => ({ ...link, status: 'planned' as const })), unreadable, warnings: plan.warnings };
+
+      const created = await this.notes.makeParents(to);
+      let published: { hash: string };
+      try {
+        published = await this.notes.publish(to, moved, true);
+        try { await this.notes.remove(from, expectedHash); }
+        catch (error) {
+          await this.notes.remove(to, published.hash).catch(rollback => {
+            throw new Error(`${errorMessage(error)}; both ${from} and ${to} now exist (rollback failed: ${errorMessage(rollback)})`);
+          });
+          throw error;
+        }
+      } catch (error) {
+        await this.notes.removeEmptyDirectories(created);
+        throw error;
+      }
+      // The move is committed; each linking note is then updated under its own hash guard.
+      const links: LinkUpdate[] = [];
+      for (const { path: name, changes } of planned) {
+        if (name === to) { links.push({ path: name, changes, status: 'updated', hash: published.hash }); continue; }
+        const update = plan.updates.get(name);
+        const original = notes.get(name);
+        if (!update || !original) continue;
+        try {
+          if ((await this.notes.read(name)).hash !== original.hash) { links.push({ path: name, changes, status: 'conflict' }); continue; }
+          links.push({ path: name, changes, status: 'updated', hash: (await this.notes.publish(name, update.content, false)).hash });
+        } catch (error) {
+          links.push({ path: name, changes, status: 'failed', error: errorMessage(error).slice(0, 512) });
+        }
+      }
+      this.freshness = { ...this.freshness, state: 'stale', reason: 'File changed' };
+      await this.refreshInternal();
+      return { from, to, hash: published.hash, dryRun, committed: true, links, unreadable, warnings: plan.warnings, freshness: this.status().freshness };
     });
   }
   search(query: string, limit = 10) {

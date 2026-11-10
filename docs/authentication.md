@@ -6,7 +6,7 @@ notifications and tool calls. Missing/wrong/malformed/duplicate credentials get
 MCP processing. There is no unauthenticated HTTP mode or old-flag fallback.
 
 Each registered token has a unique client name and the same allowed-root policy:
-read/search and edit existing supported Markdown anywhere; create new notes only
+read/search, edit and move (`note_move`) existing supported Markdown anywhere; create new notes only
 inside lowercase root-relative `ai/` or `meetings/`, including existing subdirectories. Parent
 directories must already exist. All clients can also use `attachment_create` to
 upload PNG/JPEG/GIF/WebP images only under lowercase root-relative

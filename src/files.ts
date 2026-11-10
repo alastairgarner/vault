@@ -6,6 +6,8 @@ import { hasErrorCode } from './errors.js';
 import { imagePath } from './images.js';
 import { limitsSchema, MAX_NOTE_PATH_BYTES } from './limits.js';
 import type { ResourceLimits } from './limits.js';
+import type { LinkFormat } from './links.js';
+import { z } from 'zod';
 
 export type ExactEdit = { oldText: string; newText: string };
 import { createHash, randomUUID } from 'node:crypto';
@@ -15,6 +17,14 @@ export const hash = (content: BinaryLike) => createHash('sha256').update(content
 export const MAX_BYTES = 1024 * 1024;
 const fdPath = (handle: FileHandle) => `/proc/self/fd/${handle.fd}`;
 const directoryFlags = C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW;
+
+const MAX_SETTINGS_BYTES = 64 * 1024;
+const settingsSchema = z.object({ newLinkFormat: z.enum(['shortest', 'relative', 'absolute']).catch('shortest').default('shortest') });
+
+async function syncDirectory(parent: string) {
+  const dir = await fs.open(`${parent}/.`, directoryFlags);
+  try { await dir.sync(); } finally { await dir.close(); }
+}
 
 // Linux dirfd anchoring: no check-then-follow ancestor symlink window.
 export class Notes {
@@ -35,16 +45,20 @@ export class Notes {
   }
   private async parent<T>(name: string, action: (target: string, parent: string) => Promise<T>, image = false): Promise<T> {
     const parts = this.parts(name, image);
+    return this.directory(parts.slice(0, -1), parent => action(`${parent}/${parts.at(-1)}`, parent));
+  }
+  private async directory<T>(parts: readonly string[], action: (parent: string) => Promise<T>): Promise<T> {
     const handles: FileHandle[] = [];
     let parent = this.handle;
     try {
-      for (const part of parts.slice(0, -1)) {
+      for (const part of parts) {
         parent = await fs.open(`${fdPath(parent)}/${part}`, directoryFlags);
         handles.push(parent);
       }
-      return await action(`${fdPath(parent)}/${parts.at(-1)}`, fdPath(parent));
+      return await action(fdPath(parent));
     } finally { for (const handle of handles.reverse()) await handle.close(); }
   }
+  checkPath(name: string) { this.parts(name, false); }
   async read(name: string) {
     return this.parent(name, async target => {
       const handle = await fs.open(target, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
@@ -108,11 +122,55 @@ export class Notes {
         finally { await handle.close(); }
         if (create) await fs.link(temporary, target); // Atomic no-clobber publication.
         else await fs.rename(temporary, target);
-        const dir = await fs.open(`${parent}/.`, directoryFlags);
-        try { await dir.sync(); } finally { await dir.close(); }
+        await syncDirectory(parent);
       } finally { await fs.unlink(temporary).catch(error => { if (!hasErrorCode(error, 'ENOENT')) throw error; }); }
       return { path: name, hash: hash(content) };
     }, image);
+  }
+  // Returns created directories, shallowest first, for cleanup after a failed move.
+  async makeParents(name: string) {
+    const parts = this.parts(name, false).slice(0, -1);
+    const created: string[] = [];
+    for (const [index, part] of parts.entries()) {
+      await this.directory(parts.slice(0, index), async parent => {
+        try { await fs.mkdir(`${parent}/${part}`, { mode: 0o700 }); }
+        catch (error) { if (!hasErrorCode(error, 'EEXIST')) throw error; return; }
+        created.push(parts.slice(0, index + 1).join('/'));
+      });
+    }
+    return created;
+  }
+  async removeEmptyDirectories(names: readonly string[]) {
+    for (const name of [...names].reverse()) {
+      const parts = name.split('/');
+      await this.directory(parts.slice(0, -1), parent => fs.rmdir(`${parent}/${parts.at(-1)}`)).catch(() => {});
+    }
+  }
+  // Hash checked immediately before unlinking; external writers can still race this window.
+  async remove(name: string, expectedHash: string) {
+    await this.parent(name, async (target, parent) => {
+      const handle = await fs.open(target, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+      try {
+        const stat = await handle.stat();
+        if (!stat.isFile() || stat.nlink !== 1 || stat.size > MAX_BYTES) throw new Error('Not a supported single-link Markdown file (max 1 MiB)');
+        if (hash(await handle.readFile()) !== expectedHash) throw new Error('Content hash conflict; read again');
+      } finally { await handle.close(); }
+      await fs.unlink(target);
+      await syncDirectory(parent);
+    });
+  }
+  // Obsidian's "New link format"; a missing or invalid app.json means Obsidian's default.
+  async linkFormat(): Promise<LinkFormat> {
+    try {
+      return await this.directory(['.obsidian'], async parent => {
+        const handle = await fs.open(`${parent}/app.json`, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+        try {
+          const stat = await handle.stat();
+          if (!stat.isFile() || stat.size > MAX_SETTINGS_BYTES) return 'shortest';
+          return settingsSchema.parse(JSON.parse(await handle.readFile('utf8'))).newLinkFormat;
+        } finally { await handle.close(); }
+      });
+    } catch { return 'shortest'; }
   }
   async acquireWriter() { await fs.mkdir(`${fdPath(this.handle)}/.brain-writer.lock`, { mode: 0o700 }); }
   async releaseWriter() { await fs.rmdir(`${fdPath(this.handle)}/.brain-writer.lock`); }

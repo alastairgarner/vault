@@ -21,6 +21,7 @@ export function createServer(brain: Brain): McpServer {
   const server = new McpServer({ name: 'vault', version: '0.2.0' });
   const name = z.string().min(1).max(1024);
   const text = z.string().max(1024 * 1024);
+  const sha256 = z.string().regex(/^[a-f0-9]{64}$/);
 
   server.registerTool('brain_status', {
     description: 'Allowed root and explicit index freshness. Snapshot never guarantees absence of external changes.',
@@ -55,10 +56,20 @@ export function createServer(brain: Brain): McpServer {
     description: 'Edit an existing Markdown note anywhere in the allowed root, not just ai/. Exact unique, non-overlapping replacements against original content, guarded by full-file SHA-256. No blind overwrite.',
     inputSchema: {
       path: name,
-      expectedHash: z.string().regex(/^[a-f0-9]{64}$/),
+      expectedHash: sha256,
       edits: z.array(z.object({ oldText: text.min(1), newText: text })).min(1).max(100),
     },
   }, a => respond(() => brain.edit(a.path, a.expectedHash, a.edits)));
+
+  server.registerTool('note_move', {
+    description: 'Move or rename an existing Markdown note anywhere in the allowed root, updating [[wiki]] and relative Markdown links to it across the vault like Obsidian (using its New link format setting). Guarded by the source\'s full-file SHA-256; never overwrites; creates missing destination folders. Linking notes changed since planning are reported as conflicts, not overwritten. dryRun returns the planned link changes without writing.',
+    inputSchema: {
+      path: name,
+      newPath: name,
+      expectedHash: sha256,
+      dryRun: z.boolean().default(false),
+    },
+  }, a => respond(() => brain.move({ from: a.path, to: a.newPath, expectedHash: a.expectedHash, dryRun: a.dryRun })));
 
   server.registerTool('brain_refresh', {
     description: 'Rebuild disposable QMD keyword index from a contained snapshot; returns stale on failure.',
