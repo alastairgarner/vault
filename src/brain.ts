@@ -193,9 +193,15 @@ export class Brain {
       // Notes that cannot be read cannot be scanned for links; report rather than guess.
       const notes = new Map<string, ReadResult>();
       const unreadable: { path: string; error: string }[] = [];
+      let bytes = 0;
       for (const name of names) {
-        try { notes.set(name, await this.notes.read(name)); }
-        catch (error) { unreadable.push({ path: name, error: errorMessage(error).slice(0, 512) }); }
+        let file: ReadResult;
+        try { file = await this.notes.read(name); }
+        catch (error) { unreadable.push({ path: name, error: errorMessage(error).slice(0, 512) }); continue; }
+        // Bound retained content by the same budget writes must fit.
+        bytes += Buffer.byteLength(file.content);
+        if (bytes > this.limits.maxCollectionBytes) throw new Error('Collection byte limit exceeded');
+        notes.set(name, file);
       }
       const plan = planMove({ from, to, format: await this.notes.linkFormat(),
         notes: new Map([...notes].map(([name, file]) => [name, file.content])) });

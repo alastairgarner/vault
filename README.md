@@ -133,16 +133,17 @@ unusual cases as best-effort:
   frontmatter properties. Markdown links `[text](path.md)` /
   `[text](path)` with `%20` encoding, `<angle brackets>` and titles. External URLs,
   same-note `#anchors`, fenced code blocks and inline code are ignored.
-- Resolution mirrors Obsidian: case-insensitive; exact vault path, then relative
-  to the linking note, then the shallowest note whose path ends with the link.
+- Resolution mirrors Obsidian: case-insensitive; for wiki links the exact vault
+  path, then relative to the linking note; Markdown links try the relative path
+  first (CommonMark). Then the shallowest note whose path ends with the link.
 - Only links whose target would change are rewritten. A folder move leaves a
   unique `[[note]]` untouched; a rename changes `[[old]]` to `[[new]]`. Headings,
   blocks, embeds, display text and `.md` presence are preserved, except that
   display text equal to the old note name follows the rename, as Obsidian does.
 - Rewritten links use the vault's **New link format** from `.obsidian/app.json`
   (the only hidden file read, read-only, max 64 KiB; default "shortest").
-  Markdown links that were real relative/vault paths stay path-based so they work
-  outside Obsidian. Every generated link is checked to resolve to its target,
+  Markdown links that were real relative or vault paths keep that form so they
+  work outside Obsidian. Every generated link is checked to resolve to its target,
   falling back to the full vault path.
 - The moved note's own relative links are fixed, and links elsewhere that would
   silently switch to the moved note (it now shares their name) are qualified.

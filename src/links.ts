@@ -4,8 +4,9 @@ import path from 'node:path';
 // obsidian.d.ts (getFirstLinkpathDest, fileToLinktext, renameFile) and reported behaviour.
 export type LinkFormat = 'shortest' | 'relative' | 'absolute';
 export type LinkChange = { from: string; to: string };
-// `byName` marks Obsidian's name fallback, which works only inside Obsidian.
-type Resolution = { path: string; ambiguous: boolean; byName: boolean };
+// How a link matched: `name` is Obsidian's name fallback, which works only inside Obsidian.
+type Via = 'relative' | 'vault' | 'name';
+type Resolution = { path: string; ambiguous: boolean; via: Via };
 
 const posix = path.posix;
 const stripMd = (name: string) => name.replace(/\.md$/i, '');
@@ -29,28 +30,28 @@ class Vault {
   }
   private exact(name: string) { return this.byPath.get(name.toLowerCase()); }
   isUniqueName(name: string) { return this.byName.get(posix.basename(name).toLowerCase())?.length === 1; }
-  // Exact vault path, then relative to the linking note, then the shallowest path suffix match.
-  resolve(linkpath: string, source: string): Resolution | undefined {
+  // Wiki links: exact vault path, then relative to the linking note. Markdown links follow
+  // CommonMark and try the relative path first. Then the shallowest path suffix match.
+  resolve(linkpath: string, source: string, markdown: boolean): Resolution | undefined {
     let link = linkpath.trim();
     if (!link) return undefined;
     const rooted = link.startsWith('/');
     if (rooted) link = link.slice(1);
     const file = /\.md$/i.test(link) ? link : `${link}.md`;
-    const relative = posix.normalize(posix.join(posix.dirname(source), file));
-    if (/^\.\.?\//.test(link)) {
-      const found = relative.startsWith('../') ? undefined : this.exact(relative);
-      return found ? { path: found, ambiguous: false, byName: false } : undefined;
-    }
-    const exact = this.exact(posix.normalize(file));
-    if (exact || rooted) return exact ? { path: exact, ambiguous: false, byName: false } : undefined;
-    const sibling = this.exact(relative);
-    if (sibling) return { path: sibling, ambiguous: false, byName: false };
+    const joined = posix.normalize(posix.join(posix.dirname(source), file));
+    const relative = joined.startsWith('../') ? undefined : this.exact(joined);
+    const vault = this.exact(posix.normalize(file));
+    const found = (path: string | undefined, via: Via) => path ? { path, ambiguous: false, via } : undefined;
+    if (/^\.\.?\//.test(link)) return found(relative, 'relative');
+    if (rooted) return found(vault, 'vault');
+    const direct = markdown ? found(relative, 'relative') ?? found(vault, 'vault') : found(vault, 'vault') ?? found(relative, 'relative');
+    if (direct) return direct;
     const suffix = '/' + file.toLowerCase();
     const matches = (this.byName.get(posix.basename(file).toLowerCase()) ?? [])
       .filter(name => ('/' + name.toLowerCase()).endsWith(suffix))
       .sort((a, b) => depth(a) - depth(b) || a.localeCompare(b));
     const [first] = matches;
-    return first ? { path: first, ambiguous: matches.length > 1, byName: true } : undefined;
+    return first ? { path: first, ambiguous: matches.length > 1, via: 'name' } : undefined;
   }
 }
 
@@ -189,20 +190,23 @@ function parseDestination(content: string, from: number) {
   return { raw, angle, before, after: rest[0].slice(0, -1), end: index + rest[0].length };
 }
 
-function linktext({ target, source, vault, format, keepExtension, byPath }: {
-  target: string; source: string; vault: Vault; format: LinkFormat; keepExtension: boolean; byPath: boolean;
+// `style` keeps a path-based Markdown link in the same relative or vault-path form.
+function linktext({ target, source, vault, format, keepExtension, markdown, style }: {
+  target: string; source: string; vault: Vault; format: LinkFormat; keepExtension: boolean; markdown: boolean; style: Via;
 }) {
   const shape = (name: string) => keepExtension ? name : stripMd(name);
   const relative = posix.relative(posix.dirname(source), target);
   const relatives = [relative, ...relative.startsWith('../') ? [] : [`./${relative}`]];
-  const preferred = format === 'absolute' ? [target]
-    : format === 'relative' || byPath ? relatives
+  const pathBased = markdown && style !== 'name';
+  const preferred = pathBased ? style === 'relative' ? relatives : [target]
+    : format === 'absolute' ? [target]
+    : format === 'relative' ? relatives
     : vault.isUniqueName(target) ? [posix.basename(target)] : [target];
-  // The vault path always resolves exactly, so it is the safe fallback.
+  // A rooted vault path always resolves exactly, so it is the safe fallback.
   const chosen = [...preferred, target].find(candidate => {
-    const resolved = vault.resolve(shape(candidate), source);
-    return resolved?.path === target && !(byPath && resolved.byName);
-  }) ?? target;
+    const resolved = vault.resolve(shape(candidate), source, markdown);
+    return resolved?.path === target && !(pathBased && resolved.via === 'name');
+  }) ?? `/${target}`;
   return shape(chosen);
 }
 
@@ -230,19 +234,18 @@ export function planMove({ from, to, notes, format }: {
     for (const link of parseLinks(content)) {
       if (link.start < previousEnd) continue;
       previousEnd = link.end;
-      const was = before.resolve(link.linkpath, name);
+      const was = before.resolve(link.linkpath, name, link.markdown);
       if (!was) continue;
       const wanted = was.path === from ? to : was.path;
-      const now = after.resolve(link.linkpath, source);
+      const now = after.resolve(link.linkpath, source, link.markdown);
       if ((was.ambiguous || now?.ambiguous) && [was.path, now?.path].some(p => p === from || p === to)) {
         warnings.push(`${source}: ${content.slice(link.start, link.end)} matched several notes by name; resolved to ${was.path}`);
       }
       // Path-based Markdown links stay path-based so they keep working outside Obsidian.
-      if (now?.path === wanted && !(link.markdown && !was.byName && now.byName)) continue;
+      if (now?.path === wanted && !(link.markdown && was.via !== 'name' && now.via === 'name')) continue;
       // Like Obsidian, display text equal to the old note name follows the rename.
       const text = was.path === from && link.text === oldName ? newName : link.text;
-      const byPath = link.markdown && !was.byName;
-      const replacement = link.render(linktext({ target: wanted, source, vault: after, format, keepExtension: link.keepExtension, byPath }), text);
+      const replacement = link.render(linktext({ target: wanted, source, vault: after, format, keepExtension: link.keepExtension, markdown: link.markdown, style: was.via }), text);
       next += content.slice(cursor, link.start) + replacement;
       cursor = link.end;
       changes.push({ from: content.slice(link.start, link.end), to: replacement });

@@ -80,10 +80,20 @@ test('resolution prefers exact paths, then siblings, then the shallowest name ma
 
 test('link format setting controls rewritten paths, always verified to resolve', () => {
   const notes = { 'a/Old.md': '', 'a/b/linking.md': '[[Old]] [x](../Old.md)', 'z/New.md': '' };
-  assert.equal(move('a/Old.md', 'c/New.md', notes, 'absolute').contents['a/b/linking.md'], '[[c/New]] [x](c/New.md)');
+  assert.equal(move('a/Old.md', 'c/New.md', notes, 'absolute').contents['a/b/linking.md'], '[[c/New]] [x](../../c/New.md)');
   assert.equal(move('a/Old.md', 'c/New.md', notes, 'relative').contents['a/b/linking.md'], '[[../../c/New]] [x](../../c/New.md)');
   assert.equal(move('a/Old.md', 'c/New.md', notes, 'shortest').contents['a/b/linking.md'], '[[c/New]] [x](../../c/New.md)');
   assert.equal(move('a/Old.md', 'a/b/x/New.md', notes, 'relative').contents['a/b/linking.md'], '[[x/New]] [x](x/New.md)');
+});
+
+test('Markdown links resolve relative first and keep their relative or vault-path form', () => {
+  const notes = { 'old.md': '', 'a/old.md': '', 'a/link.md': '[x](old.md) [y](../old.md) [z](a/old.md)' };
+  assert.equal(move('a/old.md', 'a/new.md', notes).contents['a/link.md'], '[x](new.md) [y](../old.md) [z](a/new.md)');
+  const root = { 'old.md': '', 'a/link.md': '[y](../old.md) [[old]]' };
+  assert.equal(move('old.md', 'new.md', root, 'absolute').contents['a/link.md'], '[y](../new.md) [[new]]');
+  // A same-named relative path would shadow the vault path, so fall back to a rooted path.
+  const shadowed = { 'old.md': '', 'a/c/new.md': '', 'a/link.md': '[x](old.md)' };
+  assert.equal(move('old.md', 'c/new.md', shadowed).contents['a/link.md'], '[x](/c/new.md)');
 });
 
 test('destination names must stay linkable', () => {
