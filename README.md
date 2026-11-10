@@ -19,12 +19,13 @@ Target deployment: Docker on a Raspberry Pi; assess ARM64 support and model reso
 - Read authoritative files or sections directly from disk.
 - Create Markdown notes without overwriting existing files.
 - Edit using unique exact old-text/new-text replacements and expected content hashes.
+- Move or rename notes, updating Obsidian wiki and Markdown links to them.
 - Enforce allowed-root boundaries, including symlink/traversal protection.
 - Serialize writes per file, verify hashes inside that critical section, and use safe atomic replacement.
 - Refresh the derived search index after writes and expose pending/stale indexing explicitly.
 - Offer stdio for local development and Streamable HTTP for shared access.
 
-V2 requires a named bearer token for every HTTP MCP request. Administrators manually configure token hashes in a private JSON file; all registered clients can read/search and edit existing notes throughout the allowed root, but can create new notes only inside lowercase root-relative `ai/` or `meetings/`. Keep access on the trusted LAN/tailnet and use HTTPS through Traefik. See [authentication setup](docs/authentication.md).
+V2 requires a named bearer token for every HTTP MCP request. Administrators manually configure token hashes in a private JSON file; all registered clients can read/search, edit and move existing notes throughout the allowed root, but can create new notes only inside lowercase root-relative `ai/` or `meetings/`. Keep access on the trusted LAN/tailnet and use HTTPS through Traefik. See [authentication setup](docs/authentication.md).
 
 ## Not settled
 
@@ -59,7 +60,9 @@ The entrypoint speaks MCP over **stdio**, not an interactive shell. For an MCP c
 - `src/errors.ts`: unknown-error handling; `test/brain.test.ts`: fixture-only integration/safety tests, including a compiled stdio client/server round trip.
 - `dist/`: generated JavaScript; never edit or commit it. Source imports intentionally use `.js` for Node ESM after compilation.
 
-Tools: `brain_status`, `note_list`, `note_read`, `note_create`, `note_edit`, `attachment_create`, `brain_refresh`, `note_search`.
+Tools: `brain_status`, `note_list`, `note_read`, `note_create`, `note_edit`, `note_move`, `attachment_create`, `brain_refresh`, `note_search`.
+
+- `src/links.ts`: Obsidian-style link parsing, resolution and rewrite planning for `note_move`.
 
 ### Image attachments
 
@@ -90,9 +93,66 @@ No data URL, whitespace, remote URL fetching or local source-file path is accept
   stripped or re-encoded; embedded payloads/metadata can remain. External shell
   access and Obsidian rendering are outside MCP enforcement. No dependency added.
 
+### Moving and renaming notes
+
+`note_move` moves or renames one existing Markdown note and updates links to it,
+like Obsidian's "Automatically update internal links". Pass
+`{ path, newPath, expectedHash, dryRun? }`, using the `hash` from `note_read`.
+`dryRun: true` returns the planned link changes and writes nothing.
+
+- **Scope:** source and destination may be anywhere in the allowed root, like
+  `note_edit`. The `ai/`/`meetings/` restriction applies only to *new* content;
+  a move keeps existing content, and renumbering project tickets elsewhere in the
+  vault is the main use case. Path rules match the other note tools (contained,
+  non-hidden, `.md`, no symlink parents). Destination names also reject
+  characters Obsidian refuses or cannot link: `* " \ < > : | ? # ^ [ ]`.
+- **Never overwrites:** an existing destination, or one differing only by case
+  (which would collide on macOS/Windows sync peers), is refused. Missing
+  destination folders are created inside the root (mode `0700`) and removed again
+  if the move fails.
+- **Order:** inside the single write queue, the server checks the source hash,
+  reads every note, plans all rewrites and checks collection budgets before
+  writing. It then publishes the destination with no-clobber, re-checks the
+  source hash and deletes it (rolling the destination back on conflict), then
+  rewrites each linking note under its own hash guard. A linking note changed
+  since planning is reported as `conflict` and left untouched; edit it with
+  `note_edit`. This is ordered and reported, not a multi-file transaction.
+  The index refreshes afterwards, so `note_list`/`note_search` show the new path.
+- **Response:** `links` lists every changed file with each old → new link and
+  `status` (`planned`, `updated`, `conflict` or `failed`); `unreadable` lists
+  notes that could not be scanned (for example non-UTF-8 or multi-link files);
+  `warnings` flags links that matched several notes by name.
+
+Link handling follows Obsidian's help pages, its public plugin API
+(`getFirstLinkpathDest`, `fileToLinktext`, `renameFile`) and reported behaviour.
+Obsidian is closed source and was not run against these fixtures, so treat
+unusual cases as best-effort:
+
+- Recognises `[[note]]`, `[[folder/note]]`, `[[note.md]]`, `![[embeds]]`,
+  `#heading`, `#^block`, `|display text`, table-escaped `\|`, and wiki links in
+  frontmatter properties. Markdown links `[text](path.md)` /
+  `[text](path)` with `%20` encoding, `<angle brackets>` and titles. External URLs,
+  same-note `#anchors`, fenced code blocks and inline code are ignored.
+- Resolution mirrors Obsidian: case-insensitive; for wiki links the exact vault
+  path, then relative to the linking note; Markdown links try the relative path
+  first (CommonMark). Then the shallowest note whose path ends with the link.
+- Only links whose target would change are rewritten. A folder move leaves a
+  unique `[[note]]` untouched; a rename changes `[[old]]` to `[[new]]`. Headings,
+  blocks, embeds, display text and `.md` presence are preserved, except that
+  display text equal to the old note name follows the rename, as Obsidian does.
+- Rewritten links use the vault's **New link format** from `.obsidian/app.json`
+  (the only hidden file read, read-only, max 64 KiB; default "shortest").
+  Markdown links that were real relative or vault paths keep that form so they
+  work outside Obsidian. Every generated link is checked to resolve to its target,
+  falling back to the full vault path.
+- The moved note's own relative links are fixed, and links elsewhere that would
+  silently switch to the moved note (it now shares their name) are qualified.
+- Not handled: folder moves, attachments, reference-style links
+  (`[x]: path.md`), HTML links, and plugin-specific link syntaxes.
+
 ### Reversible defaults and limits
 
-- One explicitly configured root; UTF-8, non-hidden `.md` files, max 1 MiB each. Symlinks and multi-link files cannot be read; directory symlinks are not traversed. No delete, move, or directory-management tools.
+- One explicitly configured root; UTF-8, non-hidden `.md` files, max 1 MiB each. Symlinks and multi-link files cannot be read; directory symlinks are not traversed. No delete or directory-management tools; `note_move` (below) is the only tool that removes a path or creates directories.
 - **Creation only:** every MCP client (HTTP and stdio) can create new notes strictly inside lowercase root-relative `ai/` or `meetings/`, including existing subdirectories. The parent directory must already exist; neither these directories nor subdirectories are created by note tools. `ai-other/`, `AI/`, `Meetings/`, absolute/traversal paths and symlink parents are rejected. Reading/searching and editing existing supported notes elsewhere remain allowed. This is enforced in the shared application creation path, not a client prompt or token scope.
 - Note tools only publish `.md` notes; the separate `attachment_create` tool publishes the limited image formats described above. No tool uploads video, creates arbitrary file extensions or directories, or installs `node_modules`/code packages. Markdown content is unrestricted (including code, scripts or embedded data); existing directories named `node_modules` are not specially banned, and supported Markdown there remains accessible under the same rules. This is not content filtering or a sandbox for external shell/filesystem access. Internally the server does create temporary publication files and a root writer-lock directory, and maintains snapshot directories/database files in separate private state.
 - **Shared Obsidian/Syncthing vault:** keep the whole vault mounted as the notes root and private state separate. No new environment, auth or Compose setting is needed for this policy. An administrator must ensure real writable `ai/` and `meetings/` directories (and `ai/attachments/` for image uploads, plus any desired subdirectories) exists in the vault before creation can work; the server does not provision it. Syncthing/external editors do not participate in the write queue/locks; the concurrent external-write limits below still apply.
@@ -136,7 +196,7 @@ Regression tests reproduce million-character headings through real authenticated
 
 ## Adding authentication tokens
 
-HTTP clients each need a token. **The client stores the original token; the application config stores only its SHA-256 hash.** All registered tokens share the same note policy: read/search and edit existing notes throughout the allowed root; create only inside lowercase root-relative `ai/` or `meetings/`.
+HTTP clients each need a token. **The client stores the original token; the application config stores only its SHA-256 hash.** All registered tokens share the same note policy: read/search, edit and move existing notes throughout the allowed root; create only inside lowercase root-relative `ai/` or `meetings/`.
 
 1. **Generate a token locally** and save it in that MCP client's private secret configuration:
 

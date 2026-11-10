@@ -9,7 +9,7 @@ import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Brain } from '../src/brain.js';
-import { hash, replaceExact } from '../src/files.js';
+import { hash, replaceExact, Notes } from '../src/files.js';
 import { createServer } from '../src/server.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -57,7 +57,7 @@ test('real QMD and MCP vertical slice: create/search/read/edit and external chan
     return schema.parse(result.structuredContent);
   };
   assert.equal(client.getServerVersion()?.name, 'vault');
-  assert.equal((await client.listTools()).tools.length, 8);
+  assert.equal((await client.listTools()).tools.length, 9);
   assert.equal((await call('brain_status', {}, statusSchema)).freshness.state, 'stale');
   const created = await call('note_create', { path: 'ai/idea.md', content: '# Brain\n\nZeppelin knowledge garden.\n' }, mutationSchema);
   assert.equal(created.committed, true);
@@ -208,7 +208,7 @@ test('compiled TypeScript MCP entrypoint works over stdio and releases locks on 
   });
   t.after(async () => { await client.close(); await fs.rm(base, { recursive: true, force: true }); });
   await client.connect(transport);
-  assert.equal((await client.listTools()).tools.length, 8);
+  assert.equal((await client.listTools()).tools.length, 9);
   const result = await client.callTool({ name: 'note_create', arguments: { path: 'ai/hello.md', content: '# Hello\nfixture' } });
   assert.ok(!result.isError);
   assert.equal(await fs.readFile(path.join(root, 'ai/hello.md'), 'utf8'), '# Hello\nfixture');
@@ -300,4 +300,104 @@ test('directory traversal has entry and depth budgets and closes iterators after
   await assert.rejects(depth.brain.list(), /scan depth limit/);
   await fs.rmdir(path.join(depth.root, 'one', 'two'));
   assert.deepEqual((await depth.brain.list()).paths, []);
+});
+
+test('note_move renames vault-wide, updates links and keeps listing/search current without refresh', async t => {
+  const { brain, root } = await fixture(t);
+  const tickets = path.join(root, 'projects', 'tickets');
+  await fs.mkdir(tickets, { recursive: true });
+  await fs.writeFile(path.join(tickets, '19-coaching.md'), '# Tier 3\nQuokka coaching [[#Tier 3]]\n');
+  await fs.writeFile(path.join(root, 'projects', 'plan.md'), 'See [[19-coaching|19-coaching]] and [ticket](tickets/19-coaching.md).\n');
+  await fs.writeFile(path.join(root, 'other.md'), '`[[19-coaching]]` stays, [[19-coaching#Tier 3]] moves.\n');
+  const source = await brain.read('projects/tickets/19-coaching.md');
+  const before = await fs.readFile(path.join(root, 'projects', 'plan.md'), 'utf8');
+  const preview = await brain.move({ from: 'projects/tickets/19-coaching.md', to: 'projects/tickets/21-coaching.md', expectedHash: source.hash, dryRun: true });
+  assert.equal(preview.committed, false);
+  assert.deepEqual(preview.links.map(link => [link.path, link.status]), [['other.md', 'planned'], ['projects/plan.md', 'planned']]);
+  assert.equal(await fs.readFile(path.join(root, 'projects', 'plan.md'), 'utf8'), before);
+  await fs.stat(path.join(tickets, '19-coaching.md'));
+
+  const moved = await brain.move({ from: 'projects/tickets/19-coaching.md', to: 'projects/tickets/21-coaching.md', expectedHash: source.hash, dryRun: false });
+  assert.equal(moved.committed, true);
+  assert.equal(moved.hash, source.hash);
+  assert.ok(moved.links.every(link => link.status === 'updated'));
+  await assert.rejects(fs.stat(path.join(tickets, '19-coaching.md')), /ENOENT/);
+  assert.equal((await brain.read('projects/tickets/21-coaching.md')).content, '# Tier 3\nQuokka coaching [[#Tier 3]]\n');
+  assert.equal(await fs.readFile(path.join(root, 'projects', 'plan.md'), 'utf8'), 'See [[21-coaching|21-coaching]] and [ticket](tickets/21-coaching.md).\n');
+  assert.equal(await fs.readFile(path.join(root, 'other.md'), 'utf8'), '`[[19-coaching]]` stays, [[21-coaching#Tier 3]] moves.\n');
+  assert.deepEqual((await brain.list()).paths, ['other.md', 'projects/plan.md', 'projects/tickets/21-coaching.md']);
+  assert.equal(moved.freshness.state, 'snapshot');
+  const [hit] = (await brain.store.searchLex('Quokka', { collection: 'notes', limit: 5 }));
+  assert.ok(hit?.filepath.endsWith('projects/tickets/21-coaching.md'));
+
+  const current = await brain.read('projects/tickets/21-coaching.md');
+  const created = await brain.move({ from: 'projects/tickets/21-coaching.md', to: 'archive/2026/21-coaching.md', expectedHash: current.hash, dryRun: false });
+  assert.equal(await fs.readFile(path.join(root, 'projects', 'plan.md'), 'utf8'), 'See [[21-coaching|21-coaching]] and [ticket](../archive/2026/21-coaching.md).\n');
+  assert.equal(created.committed, true);
+  assert.equal((await fs.stat(path.join(root, 'archive', '2026'))).isDirectory(), true);
+});
+
+test('note_move never overwrites, checks hashes and keeps destinations contained', async t => {
+  const { brain, root, base } = await fixture(t);
+  await fs.writeFile(path.join(root, 'a.md'), 'alpha');
+  await fs.writeFile(path.join(root, 'B.md'), 'beta');
+  await fs.mkdir(path.join(base, 'outside'));
+  await fs.symlink(path.join(base, 'outside'), path.join(root, 'escape'));
+  const { hash: alpha } = await brain.read('a.md');
+  const move = (to: string, expectedHash = alpha, from = 'a.md') => brain.move({ from, to, expectedHash, dryRun: false });
+  await assert.rejects(move('b.md', hash('stale')), /hash conflict/);
+  await assert.rejects(move('B.md'), /already exists/);
+  await assert.rejects(move('b.md'), /only by case/);
+  await assert.rejects(move('a.md'), /must differ/);
+  await assert.rejects(move('c.md', hash('beta'), 'missing.md'), /ENOENT/);
+  for (const to of ['../outside/a.md', '/tmp/a.md', 'escape/a.md', 'escape/new/a.md', '.hidden/a.md', 'x/.a.md', 'a.txt', 'x//a.md', 'x/../a.md', 'a#b.md', 'a|b.md', 'dir/[a].md']) {
+    await assert.rejects(move(to), to);
+  }
+  assert.deepEqual(await fs.readdir(path.join(base, 'outside')), []);
+  assert.deepEqual((await brain.list()).paths, ['B.md', 'a.md']);
+  assert.equal(await fs.readFile(path.join(root, 'a.md'), 'utf8'), 'alpha');
+  await fs.symlink(path.join(root, 'a.md'), path.join(root, 'linked.md'));
+  await assert.rejects(brain.move({ from: 'linked.md', to: 'moved.md', expectedHash: alpha, dryRun: false }));
+  await fs.stat(path.join(root, 'linked.md'));
+});
+
+test('note_move honours Obsidian link format and reports unreadable notes', async t => {
+  const { brain, root } = await fixture(t);
+  await fs.mkdir(path.join(root, '.obsidian'));
+  await fs.writeFile(path.join(root, '.obsidian', 'app.json'), JSON.stringify({ newLinkFormat: 'absolute' }));
+  await fs.writeFile(path.join(root, 'old.md'), 'body');
+  await fs.writeFile(path.join(root, 'linking.md'), '[[old]]');
+  await fs.writeFile(path.join(root, 'binary.md'), Buffer.from([0xff]));
+  const { hash: source } = await brain.read('old.md');
+  const moved = await brain.move({ from: 'old.md', to: 'notes/new.md', expectedHash: source, dryRun: false });
+  assert.equal(await fs.readFile(path.join(root, 'linking.md'), 'utf8'), '[[notes/new]]');
+  assert.deepEqual(moved.unreadable.map(note => note.path), ['binary.md']);
+  assert.deepEqual(await fs.readFile(path.join(root, 'binary.md')), Buffer.from([0xff]));
+});
+
+test('note_move rolls back on source conflict and reports linking-note conflicts', async t => {
+  const { brain, root } = await fixture(t);
+  await fs.writeFile(path.join(root, 'old.md'), 'original');
+  await fs.writeFile(path.join(root, 'one.md'), '[[old]]');
+  await fs.writeFile(path.join(root, 'two.md'), '[[old]]');
+  const { hash: source } = await brain.read('old.md');
+  const remove = Notes.prototype.remove;
+  t.after(() => { Notes.prototype.remove = remove; });
+  // Simulate external writers racing the move after planning.
+  Notes.prototype.remove = async function (name, expectedHash) {
+    if (name === 'old.md') await fs.writeFile(path.join(root, name), 'external edit');
+    return remove.call(this, name, expectedHash);
+  };
+  await assert.rejects(brain.move({ from: 'old.md', to: 'new/dir/new.md', expectedHash: source, dryRun: false }), /hash conflict/);
+  await assert.rejects(fs.stat(path.join(root, 'new')), /ENOENT/);
+  assert.equal(await fs.readFile(path.join(root, 'one.md'), 'utf8'), '[[old]]');
+  await fs.writeFile(path.join(root, 'old.md'), 'original');
+  Notes.prototype.remove = async function (name, expectedHash) {
+    await remove.call(this, name, expectedHash);
+    await fs.writeFile(path.join(root, 'two.md'), '[[old]] changed externally');
+  };
+  const moved = await brain.move({ from: 'old.md', to: 'new.md', expectedHash: source, dryRun: false });
+  assert.deepEqual(moved.links.map(link => [link.path, link.status]), [['one.md', 'updated'], ['two.md', 'conflict']]);
+  assert.equal(await fs.readFile(path.join(root, 'one.md'), 'utf8'), '[[new]]');
+  assert.equal(await fs.readFile(path.join(root, 'two.md'), 'utf8'), '[[old]] changed externally');
 });

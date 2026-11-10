@@ -102,7 +102,7 @@ test('Docker HTTP MCP: authenticated safe writes, token revocation, restart pers
   assert.equal(anonymous.status, 401);
   assert.equal(anonymous.headers.get('www-authenticate'), 'Bearer realm="markdown-brain"');
   const [a, b] = await Promise.all([connect(), connect(secondToken)]);
-  assert.equal((await a.listTools()).tools.length, 8);
+  assert.equal((await a.listTools()).tools.length, 9);
   const createdNote = await call(a, 'note_create', { path: 'ai/docker.md', content: '# Docker\nOrion observatory\n' }, mutation);
   assert.equal(createdNote.freshness.state, 'snapshot');
   const found = await call(b, 'note_search', { query: 'Orion' }, search);
@@ -125,6 +125,11 @@ test('Docker HTTP MCP: authenticated safe writes, token revocation, restart pers
   const persisted = await call(a, 'note_read', { path: 'ai/docker.md' }, note);
   assert.match(persisted.content, /Star[01]/);
   assert.equal(docker('exec', id, 'node', '-e', "process.stdout.write(require('node:fs').readFileSync('/data/notes/ai/docker.md','utf8'))"), persisted.content.trim());
+  // The read-only container can still create destination folders inside the notes volume.
+  const moveResult = z.object({ committed: z.literal(true), hash: z.string() });
+  assert.equal((await call(a, 'note_move', { path: 'ai/docker.md', newPath: 'ai/moved/docker.md', expectedHash: persisted.hash }, moveResult)).hash, persisted.hash);
+  assert.equal(docker('exec', id, 'node', '-e', "process.stdout.write(String(require('node:fs').existsSync('/data/notes/ai/docker.md')))"), 'false');
+  await call(b, 'note_move', { path: 'ai/moved/docker.md', newPath: 'ai/docker.md', expectedHash: persisted.hash }, moveResult);
   for (const args of [
     { name: 'note_create', arguments: { path: 'ai/docker.md', content: 'clobber' } },
     { name: 'note_read', arguments: { path: '../outside.md' } },

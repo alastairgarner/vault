@@ -57,7 +57,7 @@ const textResult = z.array(z.object({ type: z.literal('text'), text: z.string() 
 test('stateless HTTP shares safe QMD-backed storage across independent clients', async t => {
   const { connect, secondToken, root } = await fixture(t);
   const [a, b] = await Promise.all([connect(), connect(secondToken)]);
-  assert.equal((await a.listTools()).tools.length, 8);
+  assert.equal((await a.listTools()).tools.length, 9);
   const created = await a.callTool({ name: 'note_create', arguments: { path: 'ai/http.md', content: '# HTTP\nNeptune exploration' } });
   assert.ok(!created.isError);
   const { hash } = mutationSchema.parse(created.structuredContent);
@@ -89,6 +89,26 @@ test('stateless HTTP shares safe QMD-backed storage across independent clients',
   } });
   assert.ok(!edited.isError);
   assert.equal(await fs.readFile(path.join(root, 'existing.md'), 'utf8'), 'still editable');
+});
+
+test('HTTP note_move commits once, updates links and is visible to other clients', async t => {
+  const { connect, secondToken, root } = await fixture(t);
+  const [a, b] = await Promise.all([connect(), connect(secondToken)]);
+  await fs.writeFile(path.join(root, 'old.md'), 'Walrus');
+  await fs.writeFile(path.join(root, 'linking.md'), '[[old]] [x](old.md)');
+  const { hash } = readSchema.parse((await a.callTool({ name: 'note_read', arguments: { path: 'old.md' } })).structuredContent);
+  const moves = await Promise.all([a, b].map((client, index) => client.callTool({
+    name: 'note_move', arguments: { path: 'old.md', newPath: `new/${index}.md`, expectedHash: hash },
+  })));
+  assert.equal(moves.filter(result => !result.isError).length, 1);
+  const moved = z.object({ to: z.string(), links: z.array(z.object({ path: z.literal('linking.md'), status: z.literal('updated') })) })
+    .parse(moves.find(result => !result.isError)?.structuredContent);
+  const name = path.posix.basename(moved.to, '.md');
+  assert.equal(await fs.readFile(path.join(root, 'linking.md'), 'utf8'), `[[${name}]] [x](new/${name}.md)`);
+  const listed = await b.callTool({ name: 'note_list', arguments: {} });
+  assert.deepEqual(z.object({ paths: z.array(z.string()) }).parse(listed.structuredContent).paths, ['linking.md', moved.to]);
+  const search = await a.callTool({ name: 'note_search', arguments: { query: 'Walrus' } });
+  assert.ok(searchSchema.parse(search.structuredContent).results[0]?.reference.endsWith(moved.to));
 });
 
 test('HTTP image uploads validate bytes and boundaries before atomic publication', async t => {
