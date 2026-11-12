@@ -2,6 +2,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { Brain } from './brain.js';
 import { createServer } from './server.js';
 import { limitsFromEnv } from './limits.js';
+import { assetsFromEnv } from './assets.js';
 
 const [root, state, ...extra] = process.argv.slice(2);
 if (!root || !state || extra.length) {
@@ -11,7 +12,7 @@ if (!root || !state || extra.length) {
 // Reserve stdout exclusively for MCP JSON-RPC, including dependency diagnostics.
 console.log = console.error;
 console.info = console.error;
-const brain = await Brain.open(root, state, limitsFromEnv());
+const brain = await Brain.open(root, state, limitsFromEnv(), assetsFromEnv());
 const server = createServer(brain);
 let closing = false;
 const close = async () => {

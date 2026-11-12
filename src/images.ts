@@ -4,8 +4,11 @@ export const MAX_IMAGE_BYTES = 1024 * 1024;
 export const MAX_IMAGE_BASE64_LENGTH = 4 * Math.ceil(MAX_IMAGE_BYTES / 3);
 export const imagePath = /\.(png|jpe?g|gif|webp)$/;
 
-export function decodeImage(name: string, base64: string) {
-  if (!name.startsWith('ai/attachments/')) throw new Error('Images must be created inside root-relative lowercase ai/attachments/');
+export const VAULT_ATTACHMENTS = 'ai/attachments/';
+
+// `requirePrefix: false` is for the external assets root, where any contained path is allowed.
+export function decodeImage(name: string, base64: string, { requirePrefix = true } = {}) {
+  if (requirePrefix && !name.startsWith(VAULT_ATTACHMENTS)) throw new Error(`Images must be created inside root-relative lowercase ${VAULT_ATTACHMENTS}`);
   if (base64.length > MAX_IMAGE_BASE64_LENGTH) throw new Error('Image too large (max 1 MiB)');
   const bytes = Buffer.from(base64, 'base64');
   if (!bytes.length || bytes.toString('base64') !== base64) throw new Error('Use canonical padded base64, without a data URL or whitespace');

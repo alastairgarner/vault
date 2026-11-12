@@ -5,6 +5,7 @@ import { startHttp } from './http.js';
 import { errorMessage } from './errors.js';
 import { TokenAuth } from './auth.js';
 import { limitsFromEnv } from './limits.js';
+import { assetsFromEnv } from './assets.js';
 
 const config = z.object({
   NOTES_ROOT: z.string().min(1),
@@ -19,8 +20,9 @@ const split = (value: string) => value.split(',').map(part => part.trim()).filte
 console.log = console.error;
 console.info = console.error;
 const limits = limitsFromEnv();
+const assets = assetsFromEnv();
 const auth = await TokenAuth.fromFile(config.AUTH_CONFIG);
-const brain = await Brain.open(config.NOTES_ROOT, config.STATE_DIR, limits);
+const brain = await Brain.open(config.NOTES_ROOT, config.STATE_DIR, limits, assets);
 let listener: Awaited<ReturnType<typeof startHttp>>;
 try {
   listener = await startHttp({

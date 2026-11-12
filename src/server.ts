@@ -47,8 +47,12 @@ export function createServer(brain: Brain): McpServer {
     inputSchema: { path: name, content: text },
   }, a => respond(() => brain.create(a.path, a.content)));
 
+  const imageRules = 'Pass canonical padded base64 (no data URL), max 1 MiB decoded. PNG, JPEG, GIF or WebP only, checked by signature and matching lowercase extension; no SVG. Never overwrites: an existing path fails, so choose a new name. Images are not indexed.';
+  const attachments = brain.attachments;
   server.registerTool('attachment_create', {
-    description: 'Create an image strictly inside root-relative lowercase ai/attachments/; parent directory must already exist; never overwrite. Pass canonical padded base64 (no data URL), max 1 MiB decoded. PNG, JPEG, GIF or WebP only, checked by signature and matching lowercase extension; no SVG. Returns the vault-relative path; use note_edit separately to embed it. Images are not indexed.',
+    description: attachments.storage === 'assets'
+      ? `Upload an image to the external asset store served at ${attachments.baseUrl} (not the vault, not synced). path is relative to that store, e.g. project/screenshot.png; missing folders are created. ${imageRules} Returns url and a ready-made markdown embed; insert that into a note with note_edit. Do not use ![[...]] wiki embeds for these images.`
+      : `Create an image strictly inside root-relative lowercase ${attachments.prefix}; parent directory must already exist. ${imageRules} Returns the vault-relative path; use note_edit separately to embed it.`,
     inputSchema: { path: name, base64: z.string().min(1).max(MAX_IMAGE_BASE64_LENGTH) },
   }, a => respond(() => brain.createAttachment(a.path, a.base64)));
 

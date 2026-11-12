@@ -11,7 +11,8 @@ inside lowercase root-relative `ai/` or `meetings/`, including existing subdirec
 directories must already exist. All clients can also use `attachment_create` to
 upload PNG/JPEG/GIF/WebP images only under lowercase root-relative
 `ai/attachments/`, with existing parents, max 1 MiB, matching signature/extension
-and no overwriting. See [image limits](../README.md#image-attachments). These
+and no overwriting. If `ASSETS_ROOT`/`ASSETS_BASE_URL` are set, images instead go
+anywhere inside that external assets root, creating missing folders. See [image limits](../README.md#image-attachments). These
 creation-only boundaries also apply to stdio; no auth/config change is needed. Authenticated MCP request logs include that name, not the token. This is
 basic request attribution, not a complete per-tool audit trail. No users,
 database, OAuth/login UI, expiry, scopes, or admin HTTP endpoints are introduced.

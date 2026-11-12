@@ -88,6 +88,18 @@ No data URL, whitespace, remote URL fetching or local source-file path is accept
   delete or binary retrieval tool. On an ambiguous I/O failure, publication may
   already have committed; retrying the same path cannot clobber it, but verification
   of an existing image requires external filesystem access.
+- **External assets mode** (optional): set both `ASSETS_ROOT` and `ASSETS_BASE_URL`
+  to store images outside the vault, e.g. a directory served read-only by Caddy and
+  never synced. `path` is then relative to `ASSETS_ROOT` (any non-hidden contained
+  path, e.g. `project/shot.png`), missing parent folders are created (mode `0700`),
+  and the vault collection budgets don't apply. The response adds `url`
+  (`ASSETS_BASE_URL` + per-segment percent-encoded path) and `markdown`
+  (`![name](url)`). Insert that into a note with `note_edit`; `![[...]]` wiki embeds
+  won't resolve. An existing path fails with `Asset already exists`; choose another
+  name. The tool description and `brain_status.attachments` report the active mode.
+  The assets root must already exist, contain no symlinks and be disjoint from
+  `NOTES_ROOT` and `STATE_DIR`. It gets its own `.brain-writer.lock`. Anyone who can
+  reach the file server can read these images; it has no auth.
 - Validation identifies format signatures, **not** full image decodability, pixel
   dimensions, safe metadata or absence of malware. Files are not decoded, resized,
   stripped or re-encoded; embedded payloads/metadata can remain. External shell
@@ -293,6 +305,7 @@ HTTP settings (`pnpm dev:http` or `pnpm start:http` after building):
 | `HTTP_HOST` | `127.0.0.1` outside Docker; image defaults to `0.0.0.0` **inside** the container |
 | `PORT` | Container/server port, default `3000` |
 | `HTTP_ALLOWED_HOSTS` | Comma-separated hostnames **without ports**; default `localhost,127.0.0.1,[::1]`. Add the future Traefik DNS name explicitly; keep loopback for health checks. Never derived from forwarded headers. |
+| `ASSETS_ROOT`, `ASSETS_BASE_URL` | Optional, set both or neither (also read by stdio). Absolute existing directory for `attachment_create`, and the absolute `http(s)` URL that serves it (no credentials, query or fragment). Unset keeps images under vault `ai/attachments/`. See [image attachments](#image-attachments). |
 | `HTTP_ALLOWED_ORIGINS` | Exact allowed browser origins; empty by default rejects all requests carrying `Origin`. Native MCP clients need no Origin. No permissive CORS is enabled. |
 
 `POST /mcp` uses the official SDK's stateless Streamable HTTP with JSON responses, one SDK server/transport per request, and **one shared Brain/write queue**. There are no server-side MCP sessions, event replay, or long-lived GET/SSE streams (authenticated `GET`/`DELETE /mcp` return 405; unauthenticated `/mcp` requests return 401). `GET /health` is unauthenticated process liveness, not index freshness; use `brain_status` for freshness. Request bodies are capped at 4 MiB, with 30-second request-body/10-second header timeouts. SIGTERM stops admission, drains active requests, and releases root/state locks. Abrupt termination still requires manual lock recovery.

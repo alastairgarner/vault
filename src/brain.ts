@@ -6,8 +6,10 @@ import { Notes, replaceExact, MAX_BYTES } from './files.js';
 import { limitsSchema, MAX_SEARCH_TITLE_LENGTH, MAX_SEARCH_EXCERPT_LENGTH, MAX_SEARCH_DATA_BYTES } from './limits.js';
 import type { ResourceLimits } from './limits.js';
 import type { ExactEdit } from './files.js';
-import { errorMessage } from './errors.js';
-import { decodeImage } from './images.js';
+import { errorMessage, hasErrorCode } from './errors.js';
+import { decodeImage, VAULT_ATTACHMENTS } from './images.js';
+import { assetUrl, markdownImage } from './assets.js';
+import type { AssetsConfig } from './assets.js';
 import { assertLinkableName, planMove } from './links.js';
 import type { LinkChange } from './links.js';
 
@@ -19,6 +21,9 @@ type LinkUpdate = { path: string; changes: LinkChange[] } & (
 );
 
 const createRoots = ['ai/', 'meetings/'];
+const overlaps = (a: string, b: string) => a === b || a.startsWith(b + '/') || b.startsWith(a + '/');
+
+type Attachments = { storage: 'assets'; baseUrl: string } | { storage: 'vault'; prefix: string };
 
 export type Freshness = { externalChanges: 'not-monitored' } & (
   | { state: 'pending' }
@@ -27,44 +32,55 @@ export type Freshness = { externalChanges: 'not-monitored' } & (
 );
 
 type BrainStatus = {
-  root: string; searchMode: 'qmd-bm25'; freshness: Freshness;
+  root: string; searchMode: 'qmd-bm25'; freshness: Freshness; attachments: Attachments;
   limits: ResourceLimits; pendingOperations: number;
 };
 
 export class Brain {
-  static async open(root: string, state: string, options: Partial<ResourceLimits> = {}): Promise<Brain> {
+  static async open(root: string, state: string, options: Partial<ResourceLimits> = {}, assetsConfig?: AssetsConfig): Promise<Brain> {
     const limits = limitsSchema.parse(options);
     const notes = await Notes.open(root, limits);
+    let assets: Notes | undefined;
     let lock: string | undefined;
     let store: QMDStore | undefined;
     let ownsStateLock = false;
     let ownsRootLock = false;
+    let ownsAssetsLock = false;
     try {
       state = path.resolve(state);
       await fs.mkdir(state, { recursive: true, mode: 0o700 });
       if (await fs.realpath(state) !== state) throw new Error('State path must not contain symlinks');
-      if (state === notes.root || state.startsWith(notes.root + '/') || notes.root.startsWith(state + '/')) throw new Error('Root and state must be disjoint');
+      if (overlaps(state, notes.root)) throw new Error('Root and state must be disjoint');
+      // Never created on demand: a missing assets root is a deployment error.
+      if (assetsConfig) assets = await Notes.open(assetsConfig.root, limits);
+      if (assets && (overlaps(assets.root, notes.root) || overlaps(assets.root, state))) throw new Error('Assets root must be disjoint from root and state');
       lock = path.join(state, 'writer.lock');
       await fs.mkdir(lock); // Stale locks require manual recovery, never automatic stealing.
       ownsStateLock = true;
       await notes.acquireWriter();
       ownsRootLock = true;
+      await assets?.acquireWriter(); // Also proves the assets root is writable.
+      ownsAssetsLock = !!assets;
       const snapshot = path.join(state, 'snapshot');
       await fs.mkdir(snapshot, { recursive: true, mode: 0o700 });
       store = await createStore({ dbPath: path.join(state, 'index.sqlite'), config: {
         collections: { notes: { path: snapshot, pattern: '**/*.md' } },
       } });
-      return new Brain({ notes, snapshot, store, lock, limits });
+      return new Brain({ notes, snapshot, store, lock, limits,
+        assets: assets && assetsConfig && { notes: assets, baseUrl: assetsConfig.baseUrl } });
     } catch (error) {
       await store?.close();
       // Never remove a lock owned by another process.
       if (ownsStateLock && lock) await fs.rmdir(lock);
       if (ownsRootLock) await notes.releaseWriter();
+      if (ownsAssetsLock) await assets?.releaseWriter();
+      await assets?.close();
       await notes.close();
       throw error;
     }
   }
   private readonly notes: Notes;
+  private readonly assets: { notes: Notes; baseUrl: URL } | undefined;
   private readonly snapshot: string;
   readonly store: QMDStore;
   private readonly lock: string;
@@ -75,10 +91,12 @@ export class Brain {
   private readonly limits: ResourceLimits;
   private freshness: Freshness = { state: 'stale', reason: 'Not refreshed this session', externalChanges: 'not-monitored' };
 
-  private constructor({ notes, snapshot, store, lock, limits }: {
-    notes: Notes; snapshot: string; store: QMDStore; lock: string; limits: ResourceLimits;
+  private constructor({ notes, assets, snapshot, store, lock, limits }: {
+    notes: Notes; assets: { notes: Notes; baseUrl: URL } | undefined;
+    snapshot: string; store: QMDStore; lock: string; limits: ResourceLimits;
   }) {
     this.notes = notes;
+    this.assets = assets;
     this.snapshot = snapshot;
     this.store = store;
     this.lock = lock;
@@ -94,7 +112,11 @@ export class Brain {
     return result.finally(() => { this.pendingOperations--; });
   }
   status(): BrainStatus {
-    return { root: this.notes.root, searchMode: 'qmd-bm25', freshness: { ...this.freshness }, limits: { ...this.limits }, pendingOperations: this.pendingOperations };
+    return { root: this.notes.root, searchMode: 'qmd-bm25', freshness: { ...this.freshness }, attachments: this.attachments,
+      limits: { ...this.limits }, pendingOperations: this.pendingOperations };
+  }
+  get attachments(): Attachments {
+    return this.assets ? { storage: 'assets', baseUrl: this.assets.baseUrl.href } : { storage: 'vault', prefix: VAULT_ATTACHMENTS };
   }
   // `undefined` bytes means the write removes that file.
   private async checkWriteCapacity(writes: ReadonlyMap<string, number | undefined>) {
@@ -160,11 +182,29 @@ export class Brain {
     });
   }
   createAttachment(name: string, base64: string) {
+    if (this.assets) return this.createAsset(this.assets, name, base64);
     return this.run(async () => {
       const { bytes, mimeType } = decodeImage(name, base64);
       await this.checkWriteCapacity(new Map([[name, bytes.length]]));
       const result = await this.notes.createImage(name, bytes);
       return { ...result, committed: true, bytes: bytes.length, mimeType };
+    });
+  }
+  // Outside the vault: no collection budget, missing parents are created, never overwrites.
+  private createAsset(assets: { notes: Notes; baseUrl: URL }, name: string, base64: string) {
+    return this.run(async () => {
+      const { bytes, mimeType } = decodeImage(name, base64, { requirePrefix: false });
+      if (name.split('/').length - 1 > this.limits.maxScanDepth) throw new Error('Asset path depth limit exceeded');
+      const created = await assets.notes.makeParents(name, true);
+      let result: { path: string; hash: string };
+      try { result = await assets.notes.createImage(name, bytes); }
+      catch (error) {
+        await assets.notes.removeEmptyDirectories(created);
+        if (hasErrorCode(error, 'EEXIST')) throw new Error(`Asset already exists: ${name}; choose another path`);
+        throw error;
+      }
+      const url = assetUrl(assets.baseUrl, name);
+      return { ...result, url, markdown: markdownImage(name, url), committed: true, bytes: bytes.length, mimeType };
     });
   }
   edit(name: string, expectedHash: string, edits: readonly ExactEdit[]) {
@@ -276,8 +316,8 @@ export class Brain {
       await this.tail;
       try { await this.store.close(); }
       finally {
-        try { await this.notes.releaseWriter(); }
-        finally { await this.notes.close(); await fs.rmdir(this.lock); }
+        try { await this.notes.releaseWriter(); await this.assets?.notes.releaseWriter(); }
+        finally { await this.notes.close(); await this.assets?.notes.close(); await fs.rmdir(this.lock); }
       }
     })();
     return this.closing;

@@ -128,8 +128,8 @@ export class Notes {
     }, image);
   }
   // Returns created directories, shallowest first, for cleanup after a failed move.
-  async makeParents(name: string) {
-    const parts = this.parts(name, false).slice(0, -1);
+  async makeParents(name: string, image = false) {
+    const parts = this.parts(name, image).slice(0, -1);
     const created: string[] = [];
     for (const [index, part] of parts.entries()) {
       await this.directory(parts.slice(0, index), async parent => {
