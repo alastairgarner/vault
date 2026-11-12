@@ -60,7 +60,7 @@ The entrypoint speaks MCP over **stdio**, not an interactive shell. For an MCP c
 - `src/errors.ts`: unknown-error handling; `test/brain.test.ts`: fixture-only integration/safety tests, including a compiled stdio client/server round trip.
 - `dist/`: generated JavaScript; never edit or commit it. Source imports intentionally use `.js` for Node ESM after compilation.
 
-Tools: `brain_status`, `note_list`, `note_read`, `note_create`, `note_edit`, `note_move`, `attachment_create`, `brain_refresh`, `note_search`.
+Tools: `brain_status`, `note_list`, `note_read`, `note_create`, `note_edit`, `note_move`, `attachment_create`, `brain_refresh`, `note_search`; in external assets mode also `attachment_list` and `attachment_delete`.
 
 - `src/links.ts`: Obsidian-style link parsing, resolution and rewrite planning for `note_move`.
 
@@ -100,6 +100,15 @@ No data URL, whitespace, remote URL fetching or local source-file path is accept
   The assets root must already exist, contain no symlinks and be disjoint from
   `NOTES_ROOT` and `STATE_DIR`. It gets its own `.brain-writer.lock`. Anyone who can
   reach the file server can read these images; it has no auth.
+- **`attachment_list`** (assets mode only): images under the assets root, sorted, with
+  `url`, `bytes`, SHA-256 `hash` and `referencedBy` (vault notes containing the URL,
+  bare, percent-encoded or in `<...>`; query/fragment ignored). Optional `prefix`,
+  `offset`, `limit` (max 200). Images added externally (e.g. `scp`) are listed even
+  above the 1 MiB upload cap. Each call scans every note and hashes the page's images.
+- **`attachment_delete`** (assets mode only): `{ path, expectedHash }`. Refused while any
+  note references the image, or if any note is unreadable (its references can't be
+  checked). Removes only the image file, then any parent folders left empty. No
+  rename/move tool: delete, re-upload and edit the note instead.
 - Validation identifies format signatures, **not** full image decodability, pixel
   dimensions, safe metadata or absence of malware. Files are not decoded, resized,
   stripped or re-encoded; embedded payloads/metadata can remain. External shell

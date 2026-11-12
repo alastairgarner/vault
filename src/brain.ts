@@ -8,7 +8,7 @@ import type { ResourceLimits } from './limits.js';
 import type { ExactEdit } from './files.js';
 import { errorMessage, hasErrorCode } from './errors.js';
 import { decodeImage, VAULT_ATTACHMENTS } from './images.js';
-import { assetUrl, markdownImage } from './assets.js';
+import { assetUrl, markdownImage, referencedAssets } from './assets.js';
 import type { AssetsConfig } from './assets.js';
 import { assertLinkableName, planMove } from './links.js';
 import type { LinkChange } from './links.js';
@@ -205,6 +205,55 @@ export class Brain {
       }
       const url = assetUrl(assets.baseUrl, name);
       return { ...result, url, markdown: markdownImage(name, url), committed: true, bytes: bytes.length, mimeType };
+    });
+  }
+  private requireAssets() {
+    if (!this.assets) throw new Error('Needs external assets mode (ASSETS_ROOT and ASSETS_BASE_URL)');
+    return this.assets;
+  }
+  // Every vault note is scanned for asset URLs, within the same byte budget as moves.
+  private async assetReferences(assets: { baseUrl: URL }) {
+    const references = new Map<string, string[]>();
+    const unreadable: { path: string; error: string }[] = [];
+    let bytes = 0;
+    for (const name of await this.notes.list()) {
+      let content: string;
+      try { content = (await this.notes.read(name)).content; }
+      catch (error) { unreadable.push({ path: name, error: errorMessage(error).slice(0, 512) }); continue; }
+      bytes += Buffer.byteLength(content);
+      if (bytes > this.limits.maxCollectionBytes) throw new Error('Collection byte limit exceeded');
+      for (const asset of referencedAssets(content, assets.baseUrl)) references.set(asset, [...references.get(asset) ?? [], name]);
+    }
+    return { references, unreadable };
+  }
+  listAttachments({ prefix = '', offset = 0, limit = 100 }: { prefix?: string; offset?: number; limit?: number } = {}) {
+    return this.run(async () => {
+      const assets = this.requireAssets();
+      const all = (await assets.notes.listImages()).filter(name => name.startsWith(prefix));
+      const { references, unreadable } = await this.assetReferences(assets);
+      const images = [];
+      for (const name of all.slice(offset, offset + limit)) {
+        const url = assetUrl(assets.baseUrl, name);
+        const referencedBy = references.get(name) ?? [];
+        try { images.push({ path: name, url, ...await assets.notes.imageInfo(name), referencedBy }); }
+        catch (error) { images.push({ path: name, url, referencedBy, error: errorMessage(error).slice(0, 512) }); }
+      }
+      return { total: all.length, offset, images, truncated: offset + limit < all.length, unreadableNotes: unreadable };
+    });
+  }
+  // Refuses while any note links to the image, or if any note can't be checked.
+  deleteAttachment(name: string, expectedHash: string) {
+    return this.run(async () => {
+      const assets = this.requireAssets();
+      await assets.notes.imageInfo(name); // Validates the path and existence before scanning notes.
+      const { references, unreadable } = await this.assetReferences(assets);
+      const referencedBy = references.get(name) ?? [];
+      if (referencedBy.length) throw new Error(`Still referenced by ${referencedBy.join(', ')}; remove those embeds first`);
+      if (unreadable.length) throw new Error(`Cannot check references; unreadable notes: ${unreadable.slice(0, 5).map(note => note.path).join(', ')}`);
+      await assets.notes.removeImage(name, expectedHash);
+      const parts = name.split('/');
+      await assets.notes.removeEmptyDirectories(parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join('/')));
+      return { path: name, deleted: true, committed: true };
     });
   }
   edit(name: string, expectedHash: string, edits: readonly ExactEdit[]) {

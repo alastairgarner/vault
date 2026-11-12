@@ -56,6 +56,22 @@ export function createServer(brain: Brain): McpServer {
     inputSchema: { path: name, base64: z.string().min(1).max(MAX_IMAGE_BASE64_LENGTH) },
   }, a => respond(() => brain.createAttachment(a.path, a.base64)));
 
+  if (attachments.storage === 'assets') {
+    server.registerTool('attachment_list', {
+      description: `List images in the external asset store (${attachments.baseUrl}), sorted by path, with url, bytes, SHA-256 hash and the vault notes that link to each (referencedBy). Filter by path prefix; page with offset/limit. Images with empty referencedBy are unused.`,
+      inputSchema: {
+        prefix: z.string().max(1024).default(''),
+        offset: z.number().int().min(0).default(0),
+        limit: z.number().int().min(1).max(200).default(100),
+      },
+    }, a => respond(() => brain.listAttachments(a)));
+
+    server.registerTool('attachment_delete', {
+      description: 'Delete an image from the external asset store, guarded by its SHA-256 (from attachment_create or attachment_list). Refused while any note still links to it, or if any note cannot be checked; edit those notes first. Empty parent folders are removed. Irreversible except via backups.',
+      inputSchema: { path: name, expectedHash: sha256 },
+    }, a => respond(() => brain.deleteAttachment(a.path, a.expectedHash)));
+  }
+
   server.registerTool('note_edit', {
     description: 'Edit an existing Markdown note anywhere in the allowed root, not just ai/. Exact unique, non-overlapping replacements against original content, guarded by full-file SHA-256. No blind overwrite.',
     inputSchema: {

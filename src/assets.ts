@@ -30,6 +30,22 @@ export function assetUrl(baseUrl: URL, name: string): string {
   return new URL(name.split('/').map(encodeSegment).join('/'), baseUrl).href;
 }
 
+const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const decodeSegment = (part: string) => { try { return decodeURIComponent(part); } catch { return part; } };
+
+// Asset paths linked from Markdown: bare/encoded URLs and <angle-bracket> destinations,
+// ignoring query and fragment. Case-sensitive, matching the file server.
+export function referencedAssets(content: string, baseUrl: URL): Set<string> {
+  const base = escapeRegex(baseUrl.href);
+  const pattern = new RegExp(`<${base}([^>\\n]*)>|${base}([^\\s()<>"'\\[\\]]*)`, 'g');
+  const found = new Set<string>();
+  for (const match of content.matchAll(pattern)) {
+    const rest = (match[1] ?? match[2] ?? '').split(/[?#]/)[0] ?? '';
+    if (rest) found.add(rest.split('/').map(decodeSegment).join('/'));
+  }
+  return found;
+}
+
 export function markdownImage(name: string, url: string): string {
   const alt = path.posix.basename(name, path.posix.extname(name)).replace(/[\\[\]]/g, '\\$&');
   return `![${alt}](${url})`;

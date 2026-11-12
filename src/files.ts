@@ -3,7 +3,7 @@ import * as fs from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import type { BinaryLike } from 'node:crypto';
 import { hasErrorCode } from './errors.js';
-import { imagePath } from './images.js';
+import { imagePath, VAULT_ATTACHMENTS } from './images.js';
 import { limitsSchema, MAX_NOTE_PATH_BYTES } from './limits.js';
 import type { ResourceLimits } from './limits.js';
 import type { LinkFormat } from './links.js';
@@ -20,6 +20,20 @@ const directoryFlags = C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW;
 
 const MAX_SETTINGS_BYTES = 64 * 1024;
 const settingsSchema = z.object({ newLinkFormat: z.enum(['shortest', 'relative', 'absolute']).catch('shortest').default('shortest') });
+
+async function openSingleFile(target: string) {
+  const handle = await fs.open(target, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+  const stat = await handle.stat();
+  if (stat.isFile() && stat.nlink === 1) return handle;
+  await handle.close();
+  throw new Error('Not a supported single-link file');
+}
+
+async function hashHandle(handle: FileHandle) {
+  const digest = createHash('sha256');
+  for await (const chunk of handle.createReadStream({ start: 0, autoClose: false })) digest.update(chunk as Buffer);
+  return digest.digest('hex');
+}
 
 async function syncDirectory(parent: string) {
   const dir = await fs.open(`${parent}/.`, directoryFlags);
@@ -83,6 +97,29 @@ export class Notes {
     }, imagePath.test(name));
   }
   async list(includeImages = false) {
+    return this.scan(name => name.endsWith('.md') || (includeImages && name.startsWith(VAULT_ATTACHMENTS) && imagePath.test(name)));
+  }
+  // Every supported image anywhere under the root (external assets store).
+  async listImages() { return this.scan(name => imagePath.test(name)); }
+  // Images may be added externally (e.g. scp), so no 1 MiB cap here; hashing streams.
+  async imageInfo(name: string) {
+    return this.parent(name, async target => {
+      const handle = await openSingleFile(target);
+      try { return { bytes: (await handle.stat()).size, hash: await hashHandle(handle) }; }
+      finally { await handle.close(); }
+    }, true);
+  }
+  // Hash checked immediately before unlinking; external writers can still race this window.
+  async removeImage(name: string, expectedHash: string) {
+    await this.parent(name, async (target, parent) => {
+      const handle = await openSingleFile(target);
+      try { if (await hashHandle(handle) !== expectedHash) throw new Error('Content hash conflict; list again'); }
+      finally { await handle.close(); }
+      await fs.unlink(target);
+      await syncDirectory(parent);
+    }, true);
+  }
+  private async scan(accept: (name: string) => boolean) {
     const notes: string[] = [];
     let scanned = 0;
     const walk = async (handle: FileHandle, prefix: string, depth: number): Promise<void> => {
@@ -97,7 +134,7 @@ export class Notes {
           if (depth >= this.limits.maxScanDepth) throw new Error('Collection scan depth limit exceeded');
           const child = await fs.open(`${fdPath(handle)}/${entry.name}`, directoryFlags);
           try { await walk(child, name + '/', depth + 1); } finally { await child.close(); }
-        } else if (entry.isFile() && (entry.name.endsWith('.md') || (includeImages && name.startsWith('ai/attachments/') && imagePath.test(entry.name)))) {
+        } else if (entry.isFile() && accept(name)) {
           if (notes.length >= this.limits.maxCollectionFiles) throw new Error('Collection file limit exceeded');
           notes.push(name);
         }

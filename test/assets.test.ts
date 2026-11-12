@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Brain } from '../src/brain.js';
-import { assetsFromEnv, assetUrl, markdownImage, parseBaseUrl } from '../src/assets.js';
+import { assetsFromEnv, assetUrl, markdownImage, parseBaseUrl, referencedAssets } from '../src/assets.js';
 import { createServer } from '../src/server.js';
 import { hash } from '../src/files.js';
 import { png } from './image-fixtures.js';
@@ -137,4 +137,88 @@ test('without assets config, attachments stay in the vault', async t => {
   const result = await brain.createAttachment('ai/attachments/a.png', png);
   assert.ok(!('url' in result));
   await assert.rejects(brain.createAttachment('elsewhere/a.png', png), /ai\/attachments/);
+});
+
+test('asset references: bare, encoded and angle-bracket URLs; query/fragment ignored; other hosts not', () => {
+  const content = [
+    `![a](${base}/x/a%20b.png) text ${base}/c.png?v=1, <${base}/d e.png>`,
+    `[link](${base}/f.png#top) ![[${base}/wiki.png]] ${base}/bad%E0.png`,
+    'https://other.example.net/g.png https://files.example.net.evil/h.png',
+  ].join('\n');
+  assert.deepEqual([...referencedAssets(content, parseBaseUrl(base))].sort(),
+    ['bad%E0.png', 'c.png', 'd e.png', 'f.png', 'wiki.png', 'x/a b.png']);
+});
+
+test('attachment_list reports hashes, URLs and referencing notes, with prefix and paging', async t => {
+  const { brain, root, assets } = await fixture(t);
+  const a = await brain.createAttachment('shots/a.png', png);
+  await brain.createAttachment('shots/b c.png', png);
+  await brain.createAttachment('other.png', png);
+  await fs.writeFile(path.join(assets, 'big.png'), Buffer.alloc(2 * 1024 * 1024)); // external, over upload cap
+  await fs.writeFile(path.join(assets, 'readme.md'), 'not an image');
+  await fs.writeFile(path.join(root, 'one.md'), `![a](${base}/shots/a.png)`);
+  await fs.mkdir(path.join(root, 'ai', 'nested'));
+  await fs.writeFile(path.join(root, 'ai', 'nested', 'two.md'), `see <${base}/shots/a.png> and ${base}/shots/b%20c.png`);
+  const listed = await brain.listAttachments();
+  assert.equal(listed.total, 4);
+  assert.equal(listed.truncated, false);
+  assert.deepEqual(listed.images.map(image => [image.path, image.referencedBy]), [
+    ['big.png', []], ['other.png', []], ['shots/a.png', ['ai/nested/two.md', 'one.md']], ['shots/b c.png', ['ai/nested/two.md']],
+  ]);
+  const shot = listed.images[2];
+  assert.equal(shot && 'hash' in shot && shot.hash, a.hash);
+  assert.equal(shot?.url, `${base}/shots/a.png`);
+  const big = listed.images[0];
+  assert.equal(big && 'bytes' in big && big.bytes, 2 * 1024 * 1024);
+  const page = await brain.listAttachments({ prefix: 'shots/', offset: 1, limit: 1 });
+  assert.deepEqual([page.total, page.truncated, page.images.map(image => image.path)], [2, false, ['shots/b c.png']]);
+  assert.equal((await brain.listAttachments({ limit: 1 })).truncated, true);
+});
+
+test('attachment_delete: hash-guarded, refused while referenced or unverifiable, tidies empty folders', async t => {
+  const { brain, root, assets } = await fixture(t);
+  const kept = await brain.createAttachment('deep/er/kept.png', png);
+  const gone = await brain.createAttachment('deep/er/gone.png', png);
+  const solo = await brain.createAttachment('solo/only.png', png);
+  await fs.writeFile(path.join(root, 'uses.md'), `![x](${base}/deep/er/kept.png)`);
+  await assert.rejects(brain.deleteAttachment('deep/er/kept.png', kept.hash), /Still referenced by uses\.md/);
+  await assert.rejects(brain.deleteAttachment('deep/er/gone.png', '0'.repeat(64)), /hash conflict/);
+  await assert.rejects(brain.deleteAttachment('missing.png', gone.hash), /ENOENT/);
+  for (const name of ['../x.png', '.lock.png', 'deep/er', 'readme.md']) await assert.rejects(brain.deleteAttachment(name, gone.hash), name);
+  assert.deepEqual(await brain.deleteAttachment('deep/er/gone.png', gone.hash), { path: 'deep/er/gone.png', deleted: true, committed: true });
+  assert.deepEqual(await fs.readdir(path.join(assets, 'deep', 'er')), ['kept.png']);
+  await brain.deleteAttachment('solo/only.png', solo.hash);
+  assert.deepEqual((await fs.readdir(assets)).sort(), ['.brain-writer.lock', 'deep']);
+  // An unreadable note might hide a reference, so deletion is refused.
+  await fs.writeFile(path.join(root, 'huge.md'), 'x'.repeat(1024 * 1024 + 1));
+  await fs.writeFile(path.join(root, 'uses.md'), 'embed removed');
+  await assert.rejects(brain.deleteAttachment('deep/er/kept.png', kept.hash), /unreadable notes: huge\.md/);
+  await fs.unlink(path.join(root, 'huge.md'));
+  await brain.deleteAttachment('deep/er/kept.png', kept.hash);
+  assert.deepEqual((await fs.readdir(assets)).sort(), ['.brain-writer.lock']);
+  assert.deepEqual((await brain.listAttachments()).images, []);
+});
+
+test('list/delete tools exist only in assets mode', async t => {
+  const { brain } = await fixture(t);
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'vault-assets-tools-'));
+  await fs.mkdir(path.join(dir, 'notes'));
+  const vaultOnly = await Brain.open(path.join(dir, 'notes'), path.join(dir, 'state'));
+  t.after(async () => { await vaultOnly.close(); await fs.rm(dir, { recursive: true, force: true }); });
+  const tools = async (target: Brain) => {
+    const server = createServer(target);
+    const client = new Client({ name: 'fixture-client', version: '1' });
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    await server.connect(a);
+    await client.connect(b);
+    const names = (await client.listTools()).tools.map(tool => tool.name);
+    await client.close(); await server.close();
+    return names;
+  };
+  assert.ok((await tools(brain)).includes('attachment_delete'));
+  assert.ok((await tools(brain)).includes('attachment_list'));
+  const plain = await tools(vaultOnly);
+  assert.ok(!plain.includes('attachment_list') && !plain.includes('attachment_delete'));
+  await assert.rejects(vaultOnly.listAttachments(), /assets mode/);
+  await assert.rejects(vaultOnly.deleteAttachment('a.png', '0'.repeat(64)), /assets mode/);
 });
