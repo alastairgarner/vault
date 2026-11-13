@@ -46,7 +46,12 @@ export function referencedAssets(content: string, baseUrl: URL): Set<string> {
   return found;
 }
 
+// SilverBullet reads alt text starting with a digit, `x` or `.digit` as a size, and splits on `|`.
 export function markdownImage(name: string, url: string): string {
-  const alt = path.posix.basename(name, path.posix.extname(name)).replace(/[\\[\]]/g, '\\$&');
+  const alt = path.posix
+    .basename(name, path.posix.extname(name))
+    .replaceAll('|', '-')
+    .replace(/^(?=[x\d]|\.\d)/, '_')
+    .replace(/[\\[\]]/g, '\\$&');
   return `![${alt}](${url})`;
 }

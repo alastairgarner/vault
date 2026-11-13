@@ -47,6 +47,10 @@ test('asset URLs encode each segment and keep any base path', () => {
   assert.equal(assetUrl(parseBaseUrl(base), 'c:x/#?%.png'), `${base}/c%3Ax/%23%3F%25.png`);
   assert.equal(assetUrl(parseBaseUrl(base), 'café.png'), `${base}/caf%C3%A9.png`);
   assert.equal(markdownImage('dir/My [shot].png', `${base}/x.png`), `![My \\[shot\\]](${base}/x.png)`);
+  assert.equal(markdownImage('01-home.png', `${base}/x.png`), `![_01-home](${base}/x.png)`);
+  assert.equal(markdownImage('xbox.png', `${base}/x.png`), `![_xbox](${base}/x.png)`);
+  assert.equal(markdownImage('.5x.png', `${base}/x.png`), `![_.5x](${base}/x.png)`);
+  assert.equal(markdownImage('a|b.png', `${base}/x.png`), `![a-b](${base}/x.png)`);
 });
 
 test('attachments go to the assets root with URLs, created parents, no overwrite and no vault writes', async t => {
